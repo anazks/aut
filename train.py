@@ -6,18 +6,21 @@ warnings.filterwarnings("ignore")
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import AdaBoostClassifier
+from sklearn.tree import DecisionTreeClassifier
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.metrics import (
     roc_auc_score,
-    fbeta_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    matthews_corrcoef,
+    cohen_kappa_score,
+    log_loss,
     classification_report,
     ConfusionMatrixDisplay
 )
 from sklearn.impute import SimpleImputer
-from xgboost import XGBClassifier
 from imblearn.over_sampling import RandomOverSampler
 import joblib
 import os
@@ -34,43 +37,35 @@ os.makedirs(WORK_DIR, exist_ok=True)
 def load_and_engineer_data(path):
     df = pd.read_csv(path)
 
-    # Normalize binary values
     df = df.replace({
-        'yes': 1,
-        'no': 0,
-        '?': 'Others',
-        'others': 'Others'
+        "yes": 1,
+        "no": 0,
+        "?": "Others",
+        "others": "Others"
     })
 
     def convert_age(age):
         if age < 4:
-            return 'Toddler'
+            return "Toddler"
         elif age < 12:
-            return 'Kid'
+            return "Child"
         elif age < 18:
-            return 'Teenager'
-        elif age < 40:
-            return 'Young'
+            return "Adolescent"
         else:
-            return 'Senior'
+            return "Adult"
 
-    df['ageGroup'] = df['age'].apply(convert_age)
-
-    # Engineered features
-    df['sum_score'] = df.loc[:, 'A1_Score':'A10_Score'].sum(axis=1)
-    df['ind'] = df['austim'] + df['used_app_before'] + df['jaundice']
-
-    # IMPORTANT: training age feature
-    df['age_log'] = np.log1p(df['age'])
+    df["ageGroup"] = df["age"].apply(convert_age)
+    df["sum_score"] = df.loc[:, "A1_Score":"A10_Score"].sum(axis=1)
+    df["ind"] = df["austim"] + df["used_app_before"] + df["jaundice"]
+    df["age_log"] = np.log1p(df["age"])
 
     return df
 
 # ---------------- ENCODE CATEGORICALS ---------------- #
 def encode_and_save(df):
     encoders = {}
-
-    for col in df.select_dtypes(include='object').columns:
-        if col != 'Class/ASD':
+    for col in df.select_dtypes(include="object").columns:
+        if col != "Class/ASD":
             le = LabelEncoder()
             df[col] = le.fit_transform(df[col].astype(str))
             encoders[col] = le
@@ -80,10 +75,10 @@ def encode_and_save(df):
 
 # ---------------- PREPARE DATA ---------------- #
 def prepare_data(df):
-    drop_cols = ['ID', 'age_desc', 'used_app_before', 'austim', 'age']
+    drop_cols = ["ID", "age_desc", "used_app_before", "austim", "age"]
 
-    X = df.drop(drop_cols + ['Class/ASD'], axis=1)
-    y = df['Class/ASD']
+    X = df.drop(drop_cols + ["Class/ASD"], axis=1)
+    y = df["Class/ASD"]
 
     X_temp, X_test, y_temp, y_test = train_test_split(
         X, y,
@@ -100,23 +95,19 @@ def prepare_data(df):
         random_state=RANDOM_STATE
     )
 
-    # Impute
-    imputer = SimpleImputer(strategy='mean')
+    imputer = SimpleImputer(strategy="mean")
     X_train = imputer.fit_transform(X_train)
     X_val = imputer.transform(X_val)
     X_test = imputer.transform(X_test)
 
-    # Oversample
     ros = RandomOverSampler(random_state=RANDOM_STATE)
     X_train, y_train = ros.fit_resample(X_train, y_train)
 
-    # Scale (needed for LR, SVM, LDA)
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
     X_val = scaler.transform(X_val)
     X_test = scaler.transform(X_test)
 
-    # Save transformers
     joblib.dump(imputer, f"{WORK_DIR}/imputer.joblib")
     joblib.dump(scaler, f"{WORK_DIR}/feature_scaler.joblib")
     joblib.dump(list(X.columns), f"{WORK_DIR}/feature_columns.joblib")
@@ -130,7 +121,7 @@ def find_best_threshold(y_true, y_prob):
 
     for t in thresholds:
         y_pred = (y_prob >= t).astype(int)
-        score = fbeta_score(y_true, y_pred, beta=2)
+        score = recall_score(y_true, y_pred)
         if score > best_score:
             best_score = score
             best_t = t
@@ -141,45 +132,16 @@ def find_best_threshold(y_true, y_prob):
 def train_models(X_train, X_val, X_test, y_train, y_val, y_test):
 
     models = {
-        "Logistic Regression": LogisticRegression(
-            max_iter=2000,
-            class_weight='balanced',
+        "AdaBoost": AdaBoostClassifier(
+            estimator=DecisionTreeClassifier(max_depth=1),
+            n_estimators=200,
+            learning_rate=0.5,
             random_state=RANDOM_STATE
         ),
-
-        "SVM": SVC(
-            kernel='rbf',
-            C=1.0,
-            gamma='scale',
-            class_weight='balanced',
-            probability=True,
-            random_state=RANDOM_STATE
-        ),
-
-        "Random Forest": RandomForestClassifier(
-            n_estimators=300,
-            max_depth=10,
-            min_samples_split=5,
-            min_samples_leaf=2,
-            class_weight='balanced',
-            n_jobs=-1,
-            random_state=RANDOM_STATE
-        ),
-
-        "XGBoost": XGBClassifier(
-            n_estimators=150,
-            max_depth=5,
-            learning_rate=0.1,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            eval_metric='logloss',
-            use_label_encoder=False,
-            random_state=RANDOM_STATE
-        ),
-
-        # 🔥 LINEAR DISCRIMINANT ANALYSIS
         "LDA": LinearDiscriminantAnalysis()
     }
+
+    results = []
 
     for name, model in models.items():
         print(f"\n🚀 Training {name}")
@@ -191,27 +153,40 @@ def train_models(X_train, X_val, X_test, y_train, y_val, y_test):
         test_prob = model.predict_proba(X_test)[:, 1]
         test_pred = (test_prob >= threshold).astype(int)
 
-        print(f"Optimal Threshold: {threshold:.2f}")
+        metrics = {
+            "Model": name,
+            "AUC": roc_auc_score(y_test, test_prob),
+            "Precision": precision_score(y_test, test_pred),
+            "Recall": recall_score(y_test, test_pred),
+            "F1": f1_score(y_test, test_pred),
+            "MCC": matthews_corrcoef(y_test, test_pred),
+            "Kappa": cohen_kappa_score(y_test, test_pred),
+            "LogLoss": log_loss(y_test, test_prob)
+        }
+
+        results.append(metrics)
+
         print(classification_report(y_test, test_pred))
-        print(f"AUC: {roc_auc_score(y_test, test_prob):.4f}")
+        for k, v in metrics.items():
+            if k != "Model":
+                print(f"{k}: {v:.4f}")
 
         ConfusionMatrixDisplay.from_predictions(y_test, test_pred)
         plt.title(name)
         plt.show()
 
-        # Save model + threshold
-        joblib.dump(
-            model,
-            f"{WORK_DIR}/{name.lower().replace(' ', '_')}_model.joblib"
-        )
-        joblib.dump(
-            threshold,
-            f"{WORK_DIR}/{name.lower().replace(' ', '_')}_threshold.joblib"
-        )
+        joblib.dump(model, f"{WORK_DIR}/{name.lower()}_model.joblib")
+        joblib.dump(threshold, f"{WORK_DIR}/{name.lower()}_threshold.joblib")
+
+    results_df = pd.DataFrame(results)
+    results_df.to_csv(f"{WORK_DIR}/model_performance_metrics.csv", index=False)
+
+    print("\n📊 Final Model Performance Summary:")
+    print(results_df)
 
 # ---------------- MAIN ---------------- #
 def main():
-    print("🧠 Training ASD Models (LR + SVM + RF + XGB + LDA)")
+    print("🧠 Training ASD Models (AdaBoost + LDA)")
     df = load_and_engineer_data("train.csv")
     df = encode_and_save(df)
     X_train, X_val, X_test, y_train, y_val, y_test = prepare_data(df)

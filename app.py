@@ -2,27 +2,22 @@ import streamlit as st
 import joblib
 import numpy as np
 import pandas as pd
+from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+import tempfile
 
-# ---------------- CONFIG ---------------- #
 ARTIFACT_DIR = "model_artifacts"
+
+# ---------------- PAGE STATE ---------------- #
+if "page" not in st.session_state:
+    st.session_state.page = "home"
 
 # ---------------- LOAD ARTIFACTS ---------------- #
 @st.cache_resource
 def load_artifacts():
     models = {
-        "Logistic Regression": joblib.load(f"{ARTIFACT_DIR}/logistic_regression_model.joblib"),
-        "SVM": joblib.load(f"{ARTIFACT_DIR}/svm_model.joblib"),
-        "Random Forest": joblib.load(f"{ARTIFACT_DIR}/random_forest_model.joblib"),
-        "XGBoost": joblib.load(f"{ARTIFACT_DIR}/xgboost_model.joblib"),
-        "LDA": joblib.load(f"{ARTIFACT_DIR}/lda_model.joblib"),  # ✅ ADDED
-    }
-
-    thresholds = {
-        "Logistic Regression": joblib.load(f"{ARTIFACT_DIR}/logistic_regression_threshold.joblib"),
-        "SVM": joblib.load(f"{ARTIFACT_DIR}/svm_threshold.joblib"),
-        "Random Forest": joblib.load(f"{ARTIFACT_DIR}/random_forest_threshold.joblib"),
-        "XGBoost": joblib.load(f"{ARTIFACT_DIR}/xgboost_threshold.joblib"),
-        "LDA": joblib.load(f"{ARTIFACT_DIR}/lda_threshold.joblib"),  # ✅ ADDED
+        "AdaBoost": joblib.load(f"{ARTIFACT_DIR}/adaboost_model.joblib"),
+        "LDA": joblib.load(f"{ARTIFACT_DIR}/lda_model.joblib"),
     }
 
     feature_columns = joblib.load(f"{ARTIFACT_DIR}/feature_columns.joblib")
@@ -30,118 +25,204 @@ def load_artifacts():
     imputer = joblib.load(f"{ARTIFACT_DIR}/imputer.joblib")
     encoders = joblib.load(f"{ARTIFACT_DIR}/label_encoders.joblib")
 
-    return models, thresholds, feature_columns, scaler, imputer, encoders
+    return models, feature_columns, scaler, imputer, encoders
 
 
 # ---------------- HELPERS ---------------- #
-def yes_no_to_int(v):
+def yes_no(v):
     return 1 if v == "yes" else 0
 
 
-def safe_label_encode(encoder, value):
-    value = str(value)
-    if value in encoder.classes_:
-        return encoder.transform([value])[0]
-    return encoder.transform([encoder.classes_[0]])[0]
+def safe_encode(enc, v):
+    v = str(v)
+    return enc.transform([v])[0] if v in enc.classes_ else enc.transform([enc.classes_[0]])[0]
 
 
-# ---------------- PREPROCESS INPUT ---------------- #
-def preprocess_input(input_data, feature_columns, scaler, imputer, encoders):
+def age_group(age):
+    if age < 4:
+        return "Toddler"
+    elif age < 12:
+        return "Child"
+    elif age < 18:
+        return "Adolescent"
+    else:
+        return "Adult"
+
+
+# ---------------- PREPROCESS ---------------- #
+def preprocess_input(data, cols, scaler, imputer, encoders):
     row = {}
 
-    for col in feature_columns:
-
-        if col.startswith("A") and col.endswith("_Score"):
-            row[col] = input_data[col]
-
-        elif col == "age_log":
-            row[col] = np.log1p(input_data["age"])
-
-        elif col in ["gender", "jaundice", "austim", "used_app_before"]:
-            if col == "gender":
-                row[col] = 1 if input_data[col] == "male" else 0
-            else:
-                row[col] = yes_no_to_int(input_data[col])
-
-        elif col == "sum_score":
-            row[col] = input_data["sum_score"]
-
-        elif col == "ind":
-            row[col] = input_data["ind"]
-
-        elif col in encoders:
-            row[col] = safe_label_encode(encoders[col], input_data.get(col))
-
+    for c in cols:
+        if c.startswith("A"):
+            row[c] = data[c]
+        elif c == "age_log":
+            row[c] = np.log1p(data["age"])
+        elif c in ["gender", "jaundice", "austim", "used_app_before"]:
+            row[c] = 1 if data[c] in ["yes", "male"] else 0
+        elif c in ["sum_score", "ind"]:
+            row[c] = data[c]
+        elif c in encoders:
+            row[c] = safe_encode(encoders[c], data.get(c))
         else:
-            row[col] = 0
+            row[c] = 0
 
     df = pd.DataFrame([row])
     df = imputer.transform(df)
     df = scaler.transform(df)
-
     return df
 
 
-# ---------------- UI ---------------- #
-def main():
-    st.set_page_config("ASD Prediction", layout="wide")
+# ---------------- PDF REPORT ---------------- #
+def generate_pdf(prob, risk, age_grp, model_name):
+    styles = getSampleStyleSheet()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
 
-    st.title("🧠 Autism Spectrum Disorder Screening")
-    st.caption("Screening tool only — not a medical diagnosis.")
+    doc = SimpleDocTemplate(tmp.name)
+    content = [
+        Paragraph("<b>ASD Screening Report</b>", styles["Title"]),
+        Paragraph(f"Age Group: {age_grp}", styles["Normal"]),
+        Paragraph(f"Model Used: {model_name}", styles["Normal"]),
+        Paragraph(f"Risk Level: <b>{risk}</b>", styles["Normal"]),
+        Paragraph(f"ASD Probability: {prob:.2%}", styles["Normal"]),
+        Paragraph(
+            "<br/>This is a screening result generated using a machine learning model. "
+            "It does not represent a medical diagnosis.",
+            styles["Italic"]
+        ),
+    ]
 
-    models, thresholds, feature_columns, scaler, imputer, encoders = load_artifacts()
+    doc.build(content)
+    return tmp.name
 
-    st.sidebar.title("⚙️ Model Selection")
-    model_choice = st.sidebar.selectbox("Choose a Model", list(models.keys()))
 
-    input_data = {}
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        input_data["age"] = st.number_input("Age", 0, 100, 25, 1)
-        for i in range(1, 6):
-            input_data[f"A{i}_Score"] = st.number_input(f"A{i} Score", 0, 10, 0)
-
-    with col2:
-        input_data["gender"] = st.selectbox("Gender", ["male", "female"])
-        input_data["jaundice"] = st.selectbox("Jaundice", ["yes", "no"])
-        input_data["austim"] = st.selectbox("Autism", ["yes", "no"])
-        input_data["used_app_before"] = st.selectbox("Used App Before", ["yes", "no"])
-        for i in range(6, 11):
-            input_data[f"A{i}_Score"] = st.number_input(f"A{i} Score", 0, 10, 0)
-
-    input_data["sum_score"] = sum(input_data[f"A{i}_Score"] for i in range(1, 11))
-    input_data["ind"] = (
-        yes_no_to_int(input_data["austim"])
-        + yes_no_to_int(input_data["used_app_before"])
-        + yes_no_to_int(input_data["jaundice"])
+# ---------------- HOME SCREEN ---------------- #
+def home_screen():
+    st.markdown(
+        """
+        <style>
+        .hero {
+            background: linear-gradient(135deg, #4f46e5, #9333ea);
+            padding: 60px;
+            border-radius: 16px;
+            color: white;
+            text-align: center;
+        }
+        .card {
+            background: white;
+            padding: 25px;
+            border-radius: 14px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
     )
 
-    if st.button("🔍 Predict", use_container_width=True):
-        X = preprocess_input(input_data, feature_columns, scaler, imputer, encoders)
+    st.markdown(
+        """
+        <div class="hero">
+            <h1>🧠 Early Autism Screening System</h1>
+            <p>AI-powered risk assessment based on clinical research</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-        model = models[model_choice]
-        threshold = thresholds[model_choice]
+    st.write("")
+    col1, col2, col3 = st.columns(3)
 
-        prob = model.predict_proba(X)[0][1]
-        pred = int(prob >= threshold)
+    with col1:
+        st.markdown("<div class='card'>✅ Research-based models</div>", unsafe_allow_html=True)
+    with col2:
+        st.markdown("<div class='card'>👶 Child & Adult specific screening</div>", unsafe_allow_html=True)
+    with col3:
+        st.markdown("<div class='card'>📄 Downloadable PDF report</div>", unsafe_allow_html=True)
 
-        st.subheader("📊 Prediction Result")
+    st.write("")
+    st.info(
+        "This system follows published research. "
+        "It is designed for screening purposes only."
+    )
 
-        if pred == 1:
-            st.error("⚠️ Potential Autism Spectrum Disorder Detected")
+    st.write("")
+    if st.button("🚀 Start Screening", use_container_width=True):
+        st.session_state.page = "predict"
+        st.rerun()
+
+
+# ---------------- PREDICTION SCREEN ---------------- #
+def prediction_screen():
+    st.title("🔍 Autism Spectrum Disorder Screening")
+
+    models, cols, scaler, imputer, encoders = load_artifacts()
+
+    if st.button("⬅ Back to Home"):
+        st.session_state.page = "home"
+        st.rerun()
+
+    left, right = st.columns(2)
+    data = {}
+
+    with left:
+        data["age"] = st.number_input("Age", 0, 100, 6, 1)
+        for i in range(1, 6):
+            data[f"A{i}_Score"] = st.number_input(f"A{i} Score", 0, 10, 0)
+
+    with right:
+        data["gender"] = st.selectbox("Gender", ["male", "female"])
+        data["jaundice"] = st.selectbox("Jaundice", ["yes", "no"])
+        data["austim"] = st.selectbox("Family Autism History", ["yes", "no"])
+        data["used_app_before"] = st.selectbox("Used App Before", ["yes", "no"])
+        for i in range(6, 11):
+            data[f"A{i}_Score"] = st.number_input(f"A{i} Score", 0, 10, 0)
+
+    data["sum_score"] = sum(data[f"A{i}_Score"] for i in range(1, 11))
+    data["ind"] = (
+        yes_no(data["austim"])
+        + yes_no(data["used_app_before"])
+        + yes_no(data["jaundice"])
+    )
+
+    if st.button("🔍 Assess Risk", use_container_width=True):
+        X = preprocess_input(data, cols, scaler, imputer, encoders)
+        grp = age_group(data["age"])
+
+        # Base-paper model selection
+        model_name = "AdaBoost" if grp in ["Toddler", "Child"] else "LDA"
+        prob = models[model_name].predict_proba(X)[0][1]
+
+        if prob >= 0.65:
+            risk, color = "HIGH RISK", "🔴"
+        elif prob >= 0.45:
+            risk, color = "MODERATE RISK", "🟠"
         else:
-            st.success("✅ No Autism Spectrum Disorder Detected")
+            risk, color = "LOW RISK", "🟢"
 
-        st.metric("ASD Probability", f"{prob * 100:.2f}%")
-        st.caption(f"Decision Threshold: {threshold:.2f}")
-        st.write(f"Model Used: **{model_choice}**")
+        st.subheader("📊 Screening Result")
+        st.markdown(f"## {color} {risk}")
+        st.progress(min(prob, 1.0))
+        st.metric("ASD Probability", f"{prob:.2%}")
+        st.write(f"**Age Group:** {grp}")
+        st.write(f"**Model Used:** {model_name}")
 
-        st.subheader("🔍 Model-wise Probabilities")
-        for name, m in models.items():
-            p = m.predict_proba(X)[0][1]
-            st.write(f"{name}: {p * 100:.2f}%")
+        pdf_path = generate_pdf(prob, risk, grp, model_name)
+        with open(pdf_path, "rb") as f:
+            st.download_button(
+                "📄 Download PDF Report",
+                f,
+                file_name="asd_screening_report.pdf"
+            )
+
+
+# ---------------- ROUTER ---------------- #
+def main():
+    st.set_page_config("Autism Screening", layout="wide")
+    if st.session_state.page == "home":
+        home_screen()
+    else:
+        prediction_screen()
 
 
 if __name__ == "__main__":
